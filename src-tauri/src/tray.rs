@@ -70,6 +70,7 @@ pub fn setup(app: &AppHandle, timer_status: SharedStatus) -> tauri::Result<()> {
     // ── Background tooltip + icon updater ─────────────────────────────────────
     let app_handle = app.clone();
     let status_item_clone = status_item.clone();
+    let mut last_icon_state: Option<TrayIconState> = None;
     tokio::spawn(async move {
         loop {
             tokio::time::sleep(Duration::from_secs(10)).await;
@@ -78,6 +79,13 @@ pub fn setup(app: &AppHandle, timer_status: SharedStatus) -> tauri::Result<()> {
             let _ = status_item_clone.set_text(&text);
             if let Some(tray) = app_handle.tray_by_id("main") {
                 let _ = tray.set_tooltip(Some(text));
+                let icon_state = tray_icon_state(&snapshot);
+                if Some(icon_state) != last_icon_state {
+                    if let Some(icon) = load_tray_icon(icon_state) {
+                        let _ = tray.set_icon(Some(icon));
+                    }
+                    last_icon_state = Some(icon_state);
+                }
             }
         }
     });
@@ -147,6 +155,42 @@ fn format_status_text(status: &crate::timer::TimerStatus) -> String {
         StateKind::OnBreak => "opti-break · eye break".to_string(),
         StateKind::Paused => "opti-break · paused".to_string(),
     }
+}
+
+// ── Tray icon state ───────────────────────────────────────────────────────────
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TrayIconState {
+    Running,
+    Paused,
+    Warning,
+}
+
+fn tray_icon_state(status: &crate::timer::TimerStatus) -> TrayIconState {
+    match status.state {
+        StateKind::Warning | StateKind::OnBreak => TrayIconState::Warning,
+        StateKind::Paused => TrayIconState::Paused,
+        StateKind::Running => {
+            // Last-minute alert: ≤60 seconds to break
+            if status.seconds_until_break.map(|s| s <= 60).unwrap_or(false) {
+                TrayIconState::Warning
+            } else {
+                TrayIconState::Running
+            }
+        }
+    }
+}
+
+fn load_tray_icon(state: TrayIconState) -> Option<tauri::image::Image<'static>> {
+    let bytes: &[u8] = match state {
+        TrayIconState::Running => include_bytes!("../icons/tray-running.png"),
+        TrayIconState::Paused => include_bytes!("../icons/tray-paused.png"),
+        TrayIconState::Warning => include_bytes!("../icons/tray-warning.png"),
+    };
+    let img = image::load_from_memory(bytes).ok()?;
+    let rgba = img.to_rgba8();
+    let (w, h) = rgba.dimensions();
+    Some(tauri::image::Image::new_owned(rgba.into_raw(), w, h))
 }
 
 fn mins_until_midnight() -> u64 {

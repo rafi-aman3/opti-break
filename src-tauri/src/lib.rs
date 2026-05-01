@@ -151,6 +151,24 @@ pub fn run() {
                 .expect("failed to resolve app_data_dir");
             std::fs::create_dir_all(&app_data_dir).ok();
 
+            // Panic hook — writes to logs/panic.log so crashes are diagnosable.
+            let logs_dir = app_data_dir.join("logs");
+            std::fs::create_dir_all(&logs_dir).ok();
+            let panic_log = logs_dir.join("panic.log");
+            std::panic::set_hook(Box::new(move |info| {
+                use std::io::Write;
+                let ts = chrono::Local::now().to_rfc3339();
+                let msg = format!("[{ts}] PANIC: {info}\n");
+                if let Ok(mut f) = std::fs::OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(&panic_log)
+                {
+                    let _ = f.write_all(msg.as_bytes());
+                }
+                eprintln!("PANIC: {info}");
+            }));
+
             let db = db::open(&app_data_dir)
                 .map_err(|e| tracing::warn!("db: open failed: {e}"))
                 .ok();
@@ -176,6 +194,8 @@ pub fn run() {
                 db.clone(),
             );
 
+            let onboarded = loaded.general.onboarded;
+
             app.manage(AppState::new(
                 loaded,
                 settings_path,
@@ -198,7 +218,16 @@ pub fn run() {
                 }
             });
 
-            app.get_webview_window("main").map(|w| w.hide().ok());
+            // Show onboarding on first launch; otherwise start hidden.
+            if onboarded {
+                app.get_webview_window("main").map(|w| w.hide().ok());
+            } else {
+                if let Some(win) = app.get_webview_window("main") {
+                    win.navigate("index.html?route=onboarding".parse().unwrap()).ok();
+                    win.show().ok();
+                    win.center().ok();
+                }
+            }
 
             Ok(())
         })

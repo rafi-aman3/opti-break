@@ -58,6 +58,9 @@ pub struct GeneralSettings {
     pub autostart: bool,
     pub theme: Theme,
     pub streaks_enabled: bool,
+    /// Set to true after the user completes first-run onboarding.
+    #[serde(default)]
+    pub onboarded: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -96,6 +99,7 @@ impl Default for Settings {
                 autostart: true,
                 theme: Theme::System,
                 streaks_enabled: true,
+                onboarded: false,
             },
         }
     }

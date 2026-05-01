@@ -37,6 +37,7 @@ export const SettingsSchema = z.object({
     autostart: z.boolean(),
     theme: ThemeSchema,
     streaks_enabled: z.boolean(),
+    onboarded: z.boolean().default(false),
   }),
 });
 
@@ -47,5 +48,5 @@ export const DEFAULT_SETTINGS: Settings = {
   break: { dim_opacity: 0.78, monitors: "all", fade_in_ms: 400 },
   reminders: { warning_seconds: 10, sound_enabled: false, sound_id: "chime_soft" },
   schedule: { active_hours_enabled: false, active_hours: null, idle_threshold_minutes: 3 },
-  general: { autostart: true, theme: "system", streaks_enabled: true },
+  general: { autostart: true, theme: "system", streaks_enabled: true, onboarded: false },
 };
