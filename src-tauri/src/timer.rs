@@ -2,10 +2,11 @@ use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
-use tauri::{AppHandle, Emitter};
+use tauri::{AppHandle, Emitter, Manager};
 use tokio::sync::mpsc;
 use tokio::time::{sleep_until, Instant};
 
+use crate::db;
 use crate::settings::Settings;
 use crate::{shortcuts, windows};
 
@@ -64,6 +65,10 @@ pub enum TimerCommand {
     PostponeBreak,
     /// ESC pressed globally — skips warning or ends break early.
     EscPressed,
+    /// Idle threshold crossed while Running — pause and reset on return.
+    IdlePause,
+    /// User activity detected after idle pause — restart fresh interval.
+    IdleResume,
     SettingsUpdated(Box<Settings>),
 }
 
@@ -192,15 +197,22 @@ fn earliest_deadline(state: &State) -> Instant {
     }
 }
 
+fn overlay_count(app: &AppHandle) -> u32 {
+    app.webview_windows()
+        .into_iter()
+        .filter(|(l, _)| l.starts_with("overlay_"))
+        .count() as u32
+}
+
 // ── Timer task ───────────────────────────────────────────────────────────────
 
 pub fn spawn(
     app: AppHandle,
     initial_settings: Settings,
     status: SharedStatus,
+    db: Option<db::DbHandle>,
 ) -> mpsc::Sender<TimerCommand> {
     let (tx, mut rx) = mpsc::channel::<TimerCommand>(32);
-    // ESC shortcut handler sends on this cloned sender.
     let esc_tx = tx.clone();
 
     tokio::spawn(async move {
@@ -216,10 +228,10 @@ pub fn spawn(
 
             tokio::select! {
                 _ = sleep_until(earliest_deadline(&state)) => {
-                    state = on_deadline(state, &settings, &app, &status, &esc_tx);
+                    state = on_deadline(state, &settings, &app, &status, &esc_tx, &db);
                 }
                 Some(cmd) = rx.recv() => {
-                    state = on_command(state, cmd, &mut settings, &app, &status, &esc_tx);
+                    state = on_command(state, cmd, &mut settings, &app, &status, &esc_tx, &db);
                 }
             }
         }
@@ -234,6 +246,7 @@ fn on_deadline(
     app: &AppHandle,
     status: &SharedStatus,
     esc_tx: &mpsc::Sender<TimerCommand>,
+    db: &Option<db::DbHandle>,
 ) -> State {
     match state {
         State::Running {
@@ -263,7 +276,9 @@ fn on_deadline(
             windows::close_warning(app);
             start_break(app, status, settings, postponed_count, esc_tx)
         }
-        State::OnBreak { .. } => end_break(app, status, settings),
+        State::OnBreak { started_at, .. } => {
+            end_break(app, status, settings, started_at, false, db)
+        }
         State::Paused {
             auto_resume_at: Some(_),
             ..
@@ -295,15 +310,31 @@ fn start_break(
     };
     publish(app, status, &new_state, settings, "timer:break_started");
     windows::show_overlay(app, settings).ok();
-    // Ensure ESC is registered (might already be from Warning).
     shortcuts::register_esc(app, esc_tx.clone());
     new_state
 }
 
-fn end_break(app: &AppHandle, status: &SharedStatus, settings: &Settings) -> State {
+fn end_break(
+    app: &AppHandle,
+    status: &SharedStatus,
+    settings: &Settings,
+    started_at: Instant,
+    ended_early: bool,
+    db: &Option<db::DbHandle>,
+) -> State {
     shortcuts::unregister_esc(app);
+
+    if let Some(handle) = db {
+        let mc = overlay_count(app);
+        if ended_early {
+            let elapsed = (Instant::now() - started_at).as_secs() as u32;
+            db::record_break_event(handle, "skipped", elapsed, mc);
+        } else {
+            db::record_break_event(handle, "completed", settings.timer.break_seconds, mc);
+        }
+    }
+
     let _ = app.emit("timer:break_ended", ());
-    // Give the overlay 300ms to animate out, then force-close any remaining windows.
     let app_clone = app.clone();
     tokio::spawn(async move {
         tokio::time::sleep(Duration::from_millis(300)).await;
@@ -336,6 +367,7 @@ fn on_command(
     app: &AppHandle,
     status: &SharedStatus,
     esc_tx: &mpsc::Sender<TimerCommand>,
+    db: &Option<db::DbHandle>,
 ) -> State {
     match cmd {
         TimerCommand::Start => {
@@ -348,21 +380,37 @@ fn on_command(
             State::Warning { .. } => {
                 windows::close_warning(app);
                 shortcuts::unregister_esc(app);
+                if let Some(handle) = db {
+                    db::record_break_event(handle, "skipped", 0, 0);
+                }
                 let new_state = make_running_fresh(settings);
                 publish(app, status, &new_state, settings, "timer:state_changed");
                 new_state
             }
-            State::OnBreak { .. } => end_break(app, status, settings),
+            State::OnBreak { started_at, .. } => {
+                end_break(app, status, settings, started_at, true, db)
+            }
             other => other,
         },
 
         TimerCommand::PauseFor(duration) => {
+            // Extract started_at before consuming state via matches!
+            let break_started_at = if let State::OnBreak { started_at, .. } = &state {
+                Some(*started_at)
+            } else {
+                None
+            };
+
             if matches!(state, State::Warning { .. }) {
                 windows::close_warning(app);
                 shortcuts::unregister_esc(app);
             }
-            if matches!(state, State::OnBreak { .. }) {
+            if let Some(started_at) = break_started_at {
                 shortcuts::unregister_esc(app);
+                if let Some(handle) = db {
+                    let elapsed = (Instant::now() - started_at).as_secs() as u32;
+                    db::record_break_event(handle, "skipped", elapsed, overlay_count(app));
+                }
                 let _ = app.emit("timer:break_ended", ());
                 let app_clone = app.clone();
                 tokio::spawn(async move {
@@ -411,6 +459,9 @@ fn on_command(
             if matches!(state, State::Warning { .. }) {
                 windows::close_warning(app);
                 shortcuts::unregister_esc(app);
+                if let Some(handle) = db {
+                    db::record_break_event(handle, "skipped", 0, 0);
+                }
             }
             let new_state = make_running_fresh(settings);
             publish(app, status, &new_state, settings, "timer:state_changed");
@@ -418,6 +469,9 @@ fn on_command(
         }
 
         TimerCommand::PostponeBreak => {
+            if let Some(handle) = db {
+                db::record_break_event(handle, "postponed", 0, 0);
+            }
             let extra = Duration::from_secs(5 * 60);
             let new_state = match state {
                 State::Warning {
@@ -443,6 +497,38 @@ fn on_command(
             };
             publish(app, status, &new_state, settings, "timer:state_changed");
             new_state
+        }
+
+        TimerCommand::IdlePause => {
+            if let State::Running { next_break_at, .. } = state {
+                let total = settings.timer.interval_minutes as u64 * 60;
+                let remaining = secs_from_now(next_break_at).max(0) as u64;
+                let elapsed_secs = total.saturating_sub(remaining);
+                let new_state = State::Paused {
+                    reason: PauseReason::Idle,
+                    elapsed_secs,
+                    postponed_count: 0,
+                    auto_resume_at: None,
+                };
+                publish(app, status, &new_state, settings, "timer:state_changed");
+                new_state
+            } else {
+                state // Already paused or in warning/break — ignore
+            }
+        }
+
+        TimerCommand::IdleResume => {
+            if let State::Paused {
+                reason: PauseReason::Idle,
+                ..
+            } = state
+            {
+                let new_state = make_running_fresh(settings);
+                publish(app, status, &new_state, settings, "timer:state_changed");
+                new_state
+            } else {
+                state // Not idle-paused — ignore
+            }
         }
 
         TimerCommand::SettingsUpdated(new_settings) => {

@@ -1,5 +1,6 @@
 import { useEffect, useState } from "react";
 
+import { getSettings } from "../../lib/settings-client";
 import {
   fmtSeconds,
   onStateChanged,
@@ -8,12 +9,39 @@ import {
   type TimerStatus,
 } from "../../lib/timer-client";
 
+function playChime() {
+  try {
+    const ctx = new AudioContext();
+    const osc = ctx.createOscillator();
+    const gain = ctx.createGain();
+    osc.connect(gain);
+    gain.connect(ctx.destination);
+    osc.type = "sine";
+    osc.frequency.value = 528;
+    gain.gain.setValueAtTime(0.3, ctx.currentTime);
+    gain.gain.exponentialRampToValueAtTime(0.001, ctx.currentTime + 1.5);
+    osc.start();
+    osc.stop(ctx.currentTime + 1.5);
+    osc.onended = () => ctx.close();
+  } catch {
+    // Audio not available — silently ignore.
+  }
+}
+
 export function WarningToast() {
   const [status, setStatus] = useState<TimerStatus | null>(null);
 
   useEffect(() => {
     timerClient.getStatus().then(setStatus).catch(console.error);
     const unsubs = [onTick(setStatus), onStateChanged(setStatus)];
+
+    // Play chime once on mount if sound is enabled.
+    getSettings()
+      .then((s) => {
+        if (s.reminders.sound_enabled) playChime();
+      })
+      .catch(console.error);
+
     return () => {
       unsubs.forEach((p) => p.then((fn) => fn()));
     };

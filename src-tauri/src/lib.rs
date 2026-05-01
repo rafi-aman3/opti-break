@@ -1,3 +1,5 @@
+mod db;
+mod idle;
 mod settings;
 mod shortcuts;
 mod state;
@@ -9,7 +11,7 @@ use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
 use serde_json::Value;
-use tauri::{Manager, State, WindowEvent};
+use tauri::{AppHandle, Manager, State, WindowEvent};
 use tauri_plugin_autostart::MacosLauncher;
 
 use crate::settings::Settings;
@@ -24,26 +26,42 @@ fn get_settings(state: State<'_, AppState>) -> Settings {
 }
 
 #[tauri::command]
-fn update_settings(state: State<'_, AppState>, patch: Value) -> Result<Settings, String> {
+fn update_settings(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    patch: Value,
+) -> Result<Settings, String> {
     let mut guard = state.settings.write().unwrap();
     let merged = settings::merge_patch(&guard, patch)?;
     settings::save(&state.settings_path, &merged).map_err(|e| format!("save failed: {e}"))?;
     let _ = state
         .timer_tx
         .try_send(TimerCommand::SettingsUpdated(Box::new(merged.clone())));
+    sync_autostart(&app, merged.general.autostart);
     *guard = merged.clone();
     Ok(merged)
 }
 
 #[tauri::command]
-fn reset_settings(state: State<'_, AppState>) -> Result<Settings, String> {
+fn reset_settings(app: AppHandle, state: State<'_, AppState>) -> Result<Settings, String> {
     let defaults = Settings::default();
     settings::save(&state.settings_path, &defaults).map_err(|e| format!("save failed: {e}"))?;
     let _ = state
         .timer_tx
         .try_send(TimerCommand::SettingsUpdated(Box::new(defaults.clone())));
+    sync_autostart(&app, defaults.general.autostart);
     *state.settings.write().unwrap() = defaults.clone();
     Ok(defaults)
+}
+
+fn sync_autostart(app: &AppHandle, enabled: bool) {
+    use tauri_plugin_autostart::ManagerExt;
+    let al = app.autolaunch();
+    if enabled {
+        let _ = al.enable();
+    } else {
+        let _ = al.disable();
+    }
 }
 
 // ── Timer commands ─────────────────────────────────────────────────────────────
@@ -60,9 +78,7 @@ fn timer_start(state: State<'_, AppState>) {
 
 #[tauri::command]
 fn timer_pause(state: State<'_, AppState>) {
-    let _ = state
-        .timer_tx
-        .try_send(TimerCommand::PauseFor(None));
+    let _ = state.timer_tx.try_send(TimerCommand::PauseFor(None));
 }
 
 #[tauri::command]
@@ -114,19 +130,44 @@ pub fn run() {
                 .expect("failed to resolve app_data_dir");
             std::fs::create_dir_all(&app_data_dir).ok();
 
+            // Open analytics DB (non-fatal if it fails).
+            let db = db::open(&app_data_dir)
+                .map_err(|e| tracing::warn!("db: open failed: {e}"))
+                .ok();
+
             let settings_path = settings::settings_path(&app_data_dir);
             let loaded = settings::load(&settings_path);
 
+            // Sync autostart on first launch.
+            {
+                use tauri_plugin_autostart::ManagerExt;
+                let al = app.handle().autolaunch();
+                if loaded.general.autostart {
+                    let _ = al.enable();
+                } else {
+                    let _ = al.disable();
+                }
+            }
+
             let timer_status = Arc::new(RwLock::new(TimerStatus::default()));
-            let timer_tx =
-                timer::spawn(app.handle().clone(), loaded.clone(), timer_status.clone());
+            let timer_tx = timer::spawn(
+                app.handle().clone(),
+                loaded.clone(),
+                timer_status.clone(),
+                db.clone(),
+            );
 
             app.manage(AppState::new(
                 loaded,
                 settings_path,
-                timer_tx,
+                timer_tx.clone(),
                 timer_status.clone(),
+                db,
             ));
+
+            // Spawn idle detection task.
+            let settings_arc = app.state::<AppState>().settings_arc();
+            idle::spawn(timer_tx, settings_arc);
 
             // System tray.
             tray::setup(app.handle(), timer_status)?;
@@ -141,8 +182,6 @@ pub fn run() {
                 }
             });
 
-            // Main window starts hidden — user opens via tray Preferences.
-            // (Comment this out during dev if you want it visible on launch.)
             app.get_webview_window("main").map(|w| w.hide().ok());
 
             Ok(())
