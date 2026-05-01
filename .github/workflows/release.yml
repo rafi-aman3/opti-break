@@ -116,4 +116,5 @@ jobs:
           releaseName: 'opti-break ${{ needs.tag.outputs.tag }}'
           releaseDraft: true
           prerelease: false
+          includeUpdaterJson: false
           args: ${{ matrix.args }}
