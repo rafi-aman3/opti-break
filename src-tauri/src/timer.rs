@@ -7,6 +7,7 @@ use tokio::sync::mpsc;
 use tokio::time::{sleep_until, Instant};
 
 use crate::db;
+use crate::schedule;
 use crate::settings::Settings;
 use crate::{shortcuts, windows};
 
@@ -57,17 +58,13 @@ pub type SharedStatus = Arc<RwLock<TimerStatus>>;
 #[derive(Debug)]
 pub enum TimerCommand {
     Start,
-    /// Pause with optional auto-resume after `duration` (None = indefinite).
     PauseFor(Option<Duration>),
     Resume,
     TakeBreakNow,
     SkipNextBreak,
     PostponeBreak,
-    /// ESC pressed globally — skips warning or ends break early.
     EscPressed,
-    /// Idle threshold crossed while Running — pause and reset on return.
     IdlePause,
-    /// User activity detected after idle pause — restart fresh interval.
     IdleResume,
     SettingsUpdated(Box<Settings>),
 }
@@ -178,22 +175,37 @@ fn build_status(state: &State, settings: &Settings) -> TimerStatus {
     }
 }
 
-fn earliest_deadline(state: &State) -> Instant {
+fn earliest_deadline(state: &State, settings: &Settings) -> Instant {
     match state {
         State::Running {
             next_warning_at,
             next_break_at,
-        } => (*next_warning_at).min(*next_break_at),
+        } => {
+            let next_event = (*next_warning_at).min(*next_break_at);
+            // If active hours are enabled, wake up at least every minute to detect window boundaries.
+            if settings.schedule.active_hours_enabled {
+                next_event.min(Instant::now() + Duration::from_secs(60))
+            } else {
+                next_event
+            }
+        }
         State::Warning { break_at, .. } => *break_at,
         State::OnBreak { ends_at, .. } => *ends_at,
         State::Paused {
             auto_resume_at: Some(t),
             ..
         } => *t,
+        // OutsideHours pause: check every minute whether active hours have started.
+        State::Paused {
+            reason: PauseReason::OutsideHours,
+            auto_resume_at: None,
+            ..
+        } => Instant::now() + Duration::from_secs(60),
+        // Other indefinite pauses: tick every 10 s for UI updates.
         State::Paused {
             auto_resume_at: None,
             ..
-        } => Instant::now() + Duration::from_secs(1),
+        } => Instant::now() + Duration::from_secs(10),
     }
 }
 
@@ -202,6 +214,33 @@ fn overlay_count(app: &AppHandle) -> u32 {
         .into_iter()
         .filter(|(l, _)| l.starts_with("overlay_"))
         .count() as u32
+}
+
+/// Transition Running→OutsideHours pause or OutsideHours pause→Running based on current time.
+/// All other states are left unchanged.
+fn check_schedule(state: State, settings: &Settings, app: &AppHandle, status: &SharedStatus) -> State {
+    let in_hours = schedule::is_within_active_hours(settings);
+    match state {
+        State::Running { .. } if !in_hours => {
+            let new_state = State::Paused {
+                reason: PauseReason::OutsideHours,
+                elapsed_secs: 0,
+                postponed_count: 0,
+                auto_resume_at: None,
+            };
+            publish(app, status, &new_state, settings, "timer:state_changed");
+            new_state
+        }
+        State::Paused {
+            reason: PauseReason::OutsideHours,
+            ..
+        } if in_hours => {
+            let new_state = make_running_fresh(settings);
+            publish(app, status, &new_state, settings, "timer:state_changed");
+            new_state
+        }
+        other => other,
+    }
 }
 
 // ── Timer task ───────────────────────────────────────────────────────────────
@@ -226,8 +265,11 @@ pub fn spawn(
                 let _ = app.emit("timer:tick", &s);
             }
 
+            // Re-evaluate active-hours schedule on every iteration.
+            state = check_schedule(state, &settings, &app, &status);
+
             tokio::select! {
-                _ = sleep_until(earliest_deadline(&state)) => {
+                _ = sleep_until(earliest_deadline(&state, &settings)) => {
                     state = on_deadline(state, &settings, &app, &status, &esc_tx, &db);
                 }
                 Some(cmd) = rx.recv() => {
@@ -276,9 +318,7 @@ fn on_deadline(
             windows::close_warning(app);
             start_break(app, status, settings, postponed_count, esc_tx)
         }
-        State::OnBreak { started_at, .. } => {
-            end_break(app, status, settings, started_at, false, db)
-        }
+        State::OnBreak { started_at, .. } => end_break(app, status, settings, started_at, false, db),
         State::Paused {
             auto_resume_at: Some(_),
             ..
@@ -287,10 +327,7 @@ fn on_deadline(
             publish(app, status, &new_state, settings, "timer:state_changed");
             new_state
         }
-        State::Paused {
-            auto_resume_at: None,
-            ..
-        } => state,
+        State::Paused { .. } => state,
     }
 }
 
@@ -394,7 +431,6 @@ fn on_command(
         },
 
         TimerCommand::PauseFor(duration) => {
-            // Extract started_at before consuming state via matches!
             let break_started_at = if let State::OnBreak { started_at, .. } = &state {
                 Some(*started_at)
             } else {
@@ -490,10 +526,10 @@ fn on_command(
                     ends_at: ends_at + extra,
                     postponed_count: postponed_count + 1,
                 },
-                other => {
+                other => make_running_fresh({
                     let _ = other;
-                    make_running_fresh(settings)
-                }
+                    settings
+                }),
             };
             publish(app, status, &new_state, settings, "timer:state_changed");
             new_state
@@ -513,7 +549,7 @@ fn on_command(
                 publish(app, status, &new_state, settings, "timer:state_changed");
                 new_state
             } else {
-                state // Already paused or in warning/break — ignore
+                state
             }
         }
 
@@ -527,13 +563,13 @@ fn on_command(
                 publish(app, status, &new_state, settings, "timer:state_changed");
                 new_state
             } else {
-                state // Not idle-paused — ignore
+                state
             }
         }
 
         TimerCommand::SettingsUpdated(new_settings) => {
             *settings = *new_settings;
-            match state {
+            let state = match state {
                 State::Running { next_break_at, .. } => {
                     let remaining =
                         Duration::from_secs(secs_from_now(next_break_at).max(0) as u64);
@@ -550,7 +586,9 @@ fn on_command(
                     }
                 }
                 other => other,
-            }
+            };
+            // Re-evaluate schedule immediately after settings change.
+            check_schedule(state, settings, app, status)
         }
     }
 }

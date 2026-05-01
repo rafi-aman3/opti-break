@@ -1,5 +1,6 @@
 mod db;
 mod idle;
+mod schedule;
 mod settings;
 mod shortcuts;
 mod state;
@@ -11,7 +12,7 @@ use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
 use serde_json::Value;
-use tauri::{AppHandle, Manager, State, WindowEvent};
+use tauri::{AppHandle, Emitter, Manager, State, WindowEvent};
 use tauri_plugin_autostart::MacosLauncher;
 
 use crate::settings::Settings;
@@ -38,6 +39,7 @@ fn update_settings(
         .timer_tx
         .try_send(TimerCommand::SettingsUpdated(Box::new(merged.clone())));
     sync_autostart(&app, merged.general.autostart);
+    let _ = app.emit("settings:updated", &merged);
     *guard = merged.clone();
     Ok(merged)
 }
@@ -50,6 +52,7 @@ fn reset_settings(app: AppHandle, state: State<'_, AppState>) -> Result<Settings
         .timer_tx
         .try_send(TimerCommand::SettingsUpdated(Box::new(defaults.clone())));
     sync_autostart(&app, defaults.general.autostart);
+    let _ = app.emit("settings:updated", &defaults);
     *state.settings.write().unwrap() = defaults.clone();
     Ok(defaults)
 }
@@ -110,6 +113,24 @@ fn postpone_break(state: State<'_, AppState>) {
     let _ = state.timer_tx.try_send(TimerCommand::PostponeBreak);
 }
 
+// ── Analytics commands ─────────────────────────────────────────────────────────
+
+#[tauri::command]
+fn get_day_stats(state: State<'_, AppState>, days: u32) -> Result<Vec<db::DayStats>, String> {
+    let Some(ref db) = state.db else {
+        return Ok(vec![]);
+    };
+    db::query_day_stats(db, days).map_err(|e| format!("db error: {e}"))
+}
+
+#[tauri::command]
+fn get_aggregates(state: State<'_, AppState>) -> Result<db::Aggregates, String> {
+    let Some(ref db) = state.db else {
+        return Ok(db::Aggregates::default());
+    };
+    db::query_aggregates(db).map_err(|e| format!("db error: {e}"))
+}
+
 // ── App setup ─────────────────────────────────────────────────────────────────
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -130,7 +151,6 @@ pub fn run() {
                 .expect("failed to resolve app_data_dir");
             std::fs::create_dir_all(&app_data_dir).ok();
 
-            // Open analytics DB (non-fatal if it fails).
             let db = db::open(&app_data_dir)
                 .map_err(|e| tracing::warn!("db: open failed: {e}"))
                 .ok();
@@ -138,7 +158,6 @@ pub fn run() {
             let settings_path = settings::settings_path(&app_data_dir);
             let loaded = settings::load(&settings_path);
 
-            // Sync autostart on first launch.
             {
                 use tauri_plugin_autostart::ManagerExt;
                 let al = app.handle().autolaunch();
@@ -165,14 +184,11 @@ pub fn run() {
                 db,
             ));
 
-            // Spawn idle detection task.
             let settings_arc = app.state::<AppState>().settings_arc();
             idle::spawn(timer_tx, settings_arc);
 
-            // System tray.
             tray::setup(app.handle(), timer_status)?;
 
-            // Hide main window on close instead of quitting.
             let main_win = app.get_webview_window("main").expect("no main window");
             let win_clone = main_win.clone();
             main_win.on_window_event(move |event| {
@@ -200,6 +216,9 @@ pub fn run() {
             take_break_now,
             skip_next_break,
             postpone_break,
+            // analytics
+            get_day_stats,
+            get_aggregates,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
