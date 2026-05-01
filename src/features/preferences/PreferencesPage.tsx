@@ -2,6 +2,7 @@ import { useEffect, useState } from "react";
 
 import { type Settings } from "../../shared/settings";
 import { getSettings, resetSettings } from "../../lib/settings-client";
+import { DebugPanel } from "../debug/DebugPanel";
 
 export function PreferencesPage() {
   const [settings, setSettings] = useState<Settings | null>(null);
@@ -41,6 +42,7 @@ export function PreferencesPage() {
           >
             Reset to defaults
           </button>
+          <DebugPanel />
         </section>
       )}
     </main>
