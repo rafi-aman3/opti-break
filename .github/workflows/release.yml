@@ -2,14 +2,66 @@ name: Release
 
 on:
   push:
-    tags:
-      - 'v[0-9]*'
+    branches: [main]
 
 permissions:
   contents: write
 
 jobs:
+  # ── Compute next semver from git tags + conventional commits ─────────────────
+  tag:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.ver.outputs.version }}
+      tag: ${{ steps.ver.outputs.tag }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Compute next version
+        id: ver
+        run: |
+          # Latest semver tag, defaulting to v0.0.0
+          LATEST=$(git tag --sort=-v:refname | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' | head -1)
+          if [ -z "$LATEST" ]; then LATEST="v0.0.0"; fi
+
+          CURRENT="${LATEST#v}"
+          MAJOR=$(echo $CURRENT | cut -d. -f1)
+          MINOR=$(echo $CURRENT | cut -d. -f2)
+          PATCH=$(echo $CURRENT | cut -d. -f3)
+
+          # Collect commits (subjects + full bodies) since last tag
+          if [ "$LATEST" = "v0.0.0" ]; then
+            SUBJECTS=$(git log --pretty=%s)
+            BODIES=$(git log --pretty=%B)
+          else
+            SUBJECTS=$(git log ${LATEST}..HEAD --pretty=%s)
+            BODIES=$(git log ${LATEST}..HEAD --pretty=%B)
+          fi
+
+          # Highest-priority bump wins: breaking > minor > patch
+          if echo "$BODIES" | grep -q "BREAKING CHANGE" || echo "$SUBJECTS" | grep -qE "^[a-z]+(\(.+\))?!:"; then
+            NEW_VERSION="$((MAJOR + 1)).0.0"
+          elif echo "$SUBJECTS" | grep -qE "^feat(\(.+\))?:"; then
+            NEW_VERSION="${MAJOR}.$((MINOR + 1)).0"
+          else
+            NEW_VERSION="${MAJOR}.${MINOR}.$((PATCH + 1))"
+          fi
+
+          echo "version=$NEW_VERSION" >> $GITHUB_OUTPUT
+          echo "tag=v$NEW_VERSION" >> $GITHUB_OUTPUT
+
+      - name: Create and push tag
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git tag ${{ steps.ver.outputs.tag }}
+          git push origin ${{ steps.ver.outputs.tag }}
+
+  # ── Build for each platform and attach to the draft release ──────────────────
   build:
+    needs: tag
     strategy:
       fail-fast: false
       matrix:
@@ -24,54 +76,44 @@ jobs:
     runs-on: ${{ matrix.platform }}
 
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
-      - name: Set up pnpm
-        uses: pnpm/action-setup@v4
+      - name: Patch version in tauri.conf.json
+        shell: bash
+        run: |
+          node -e "
+            const fs = require('fs');
+            const cfg = JSON.parse(fs.readFileSync('src-tauri/tauri.conf.json', 'utf8'));
+            cfg.version = '${{ needs.tag.outputs.version }}';
+            fs.writeFileSync('src-tauri/tauri.conf.json', JSON.stringify(cfg, null, 2));
+          "
+
+      - uses: pnpm/action-setup@v4
         with:
           version: 9
 
-      - name: Set up Node.js
-        uses: actions/setup-node@v4
+      - uses: actions/setup-node@v4
         with:
           node-version: '22'
           cache: 'pnpm'
 
-      - name: Install Rust (stable)
-        uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.rust-targets }}
 
-      - name: Cache Rust build
-        uses: swatinem/rust-cache@v2
+      - uses: swatinem/rust-cache@v2
         with:
           workspaces: './src-tauri -> target'
 
-      - name: Install frontend dependencies
-        run: pnpm install
+      - run: pnpm install
 
-      - name: Build and package (macOS universal)
-        if: matrix.platform == 'macos-latest'
-        uses: tauri-apps/tauri-action@v0
+      - uses: tauri-apps/tauri-action@v0
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           MACOSX_DEPLOYMENT_TARGET: '10.15'
         with:
-          tagName: ${{ github.ref_name }}
-          releaseName: 'opti-break ${{ github.ref_name }}'
-          releaseDraft: true
-          prerelease: false
-          args: ${{ matrix.args }}
-
-      - name: Build and package (Windows)
-        if: matrix.platform == 'windows-latest'
-        uses: tauri-apps/tauri-action@v0
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        with:
-          tagName: ${{ github.ref_name }}
-          releaseName: 'opti-break ${{ github.ref_name }}'
+          tagName: ${{ needs.tag.outputs.tag }}
+          releaseName: 'opti-break ${{ needs.tag.outputs.tag }}'
           releaseDraft: true
           prerelease: false
           args: ${{ matrix.args }}
