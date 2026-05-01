@@ -1,0 +1,9 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "warning",
+  "description": "Permissions for the warning toast window",
+  "windows": ["warning"],
+  "permissions": [
+    "core:default"
+  ]
+}

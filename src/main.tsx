@@ -20,8 +20,14 @@ function resolveRoute(): Route {
   }
 }
 
+// Transparent body for frameless windows.
+const route = resolveRoute();
+if (route === "warning" || route === "overlay") {
+  document.documentElement.style.background = "transparent";
+  document.body.style.background = "transparent";
+}
+
 function Root() {
-  const route = resolveRoute();
   switch (route) {
     case "warning":
       return <WarningToast />;

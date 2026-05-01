@@ -7,6 +7,7 @@ use tokio::sync::mpsc;
 use tokio::time::{sleep_until, Instant};
 
 use crate::settings::Settings;
+use crate::windows;
 
 // ── Public types ─────────────────────────────────────────────────────────────
 
@@ -55,12 +56,12 @@ pub type SharedStatus = Arc<RwLock<TimerStatus>>;
 #[derive(Debug)]
 pub enum TimerCommand {
     Start,
-    Pause(PauseReason),
+    /// Pause with optional auto-resume after `duration` (None = indefinite).
+    PauseFor(Option<Duration>),
     Resume,
     TakeBreakNow,
     SkipNextBreak,
     PostponeBreak,
-    /// Fired when settings change so the timer re-evaluates its deadlines.
     SettingsUpdated(Box<Settings>),
 }
 
@@ -82,9 +83,9 @@ enum State {
     },
     Paused {
         reason: PauseReason,
-        /// How far into the current interval we were when we paused.
         elapsed_secs: u64,
         postponed_count: u32,
+        auto_resume_at: Option<Instant>,
     },
 }
 
@@ -94,6 +95,21 @@ fn secs_from_now(instant: Instant) -> i64 {
         (instant - now).as_secs() as i64
     } else {
         -((now - instant).as_secs() as i64)
+    }
+}
+
+fn make_running_fresh(settings: &Settings) -> State {
+    let interval = Duration::from_secs(settings.timer.interval_minutes as u64 * 60);
+    let warning = Duration::from_secs(settings.reminders.warning_seconds as u64);
+    let next_break_at = Instant::now() + interval;
+    let next_warning_at = if warning.is_zero() || warning >= interval {
+        next_break_at
+    } else {
+        next_break_at - warning
+    };
+    State::Running {
+        next_warning_at,
+        next_break_at,
     }
 }
 
@@ -137,6 +153,7 @@ fn build_status(state: &State, settings: &Settings) -> TimerStatus {
             reason,
             elapsed_secs,
             postponed_count,
+            ..
         } => {
             let remaining_secs =
                 (settings.timer.interval_minutes as i64 * 60) - (*elapsed_secs as i64);
@@ -162,8 +179,14 @@ fn earliest_deadline(state: &State) -> Instant {
         } => (*next_warning_at).min(*next_break_at),
         State::Warning { break_at, .. } => *break_at,
         State::OnBreak { ends_at, .. } => *ends_at,
-        // Paused: sleep for 1s so we can still emit ticks for status updates.
-        State::Paused { .. } => Instant::now() + Duration::from_secs(1),
+        State::Paused {
+            auto_resume_at: Some(t),
+            ..
+        } => *t,
+        State::Paused {
+            auto_resume_at: None,
+            ..
+        } => Instant::now() + Duration::from_secs(1),
     }
 }
 
@@ -181,17 +204,15 @@ pub fn spawn(
         let mut state = make_running_fresh(&settings);
 
         loop {
-            let deadline = earliest_deadline(&state);
-
-            // Update shared status for get_timer_status reads.
+            // Publish current status before sleeping.
             {
                 let s = build_status(&state, &settings);
                 *status.write().unwrap() = s.clone();
-                let _ = app.emit("timer:tick", s);
+                let _ = app.emit("timer:tick", &s);
             }
 
             tokio::select! {
-                _ = sleep_until(deadline) => {
+                _ = sleep_until(earliest_deadline(&state)) => {
                     state = on_deadline(state, &settings, &app, &status);
                 }
                 Some(cmd) = rx.recv() => {
@@ -204,22 +225,12 @@ pub fn spawn(
     tx
 }
 
-fn make_running_fresh(settings: &Settings) -> State {
-    let interval = Duration::from_secs(settings.timer.interval_minutes as u64 * 60);
-    let warning = Duration::from_secs(settings.reminders.warning_seconds as u64);
-    let next_break_at = Instant::now() + interval;
-    let next_warning_at = if warning.is_zero() {
-        next_break_at
-    } else {
-        next_break_at - warning
-    };
-    State::Running {
-        next_warning_at: next_warning_at.max(Instant::now()),
-        next_break_at,
-    }
-}
-
-fn on_deadline(state: State, settings: &Settings, app: &AppHandle, status: &SharedStatus) -> State {
+fn on_deadline(
+    state: State,
+    settings: &Settings,
+    app: &AppHandle,
+    status: &SharedStatus,
+) -> State {
     match state {
         State::Running {
             next_warning_at,
@@ -227,44 +238,48 @@ fn on_deadline(state: State, settings: &Settings, app: &AppHandle, status: &Shar
         } => {
             let now = Instant::now();
             if now >= next_break_at {
-                // Skipped past warning (warning_seconds == 0), go straight to break.
+                // warning_seconds == 0 — skip straight to break.
                 start_break(app, status, settings, 0)
             } else if now >= next_warning_at {
                 let new_state = State::Warning {
                     break_at: next_break_at,
                     postponed_count: 0,
                 };
-                let s = build_status(&new_state, settings);
-                *status.write().unwrap() = s.clone();
-                let _ = app.emit("timer:warning_started", s);
-                let _ = app.emit("timer:state_changed", build_status(&new_state, settings));
+                publish_and_emit(app, status, &new_state, settings, "timer:warning_started");
+                windows::show_warning(app).ok();
                 new_state
             } else {
-                // Not yet — keep running (shouldn't normally happen).
                 State::Running {
                     next_warning_at,
                     next_break_at,
                 }
             }
         }
-        State::Warning {
-            break_at: _,
-            postponed_count,
-        } => start_break(app, status, settings, postponed_count),
-        State::OnBreak {
-            started_at: _,
-            ends_at: _,
-            postponed_count: _,
-        } => {
+        State::Warning { postponed_count, .. } => {
+            windows::close_warning(app);
+            start_break(app, status, settings, postponed_count)
+        }
+        State::OnBreak { .. } => {
+            windows::close_overlay(app);
             let _ = app.emit("timer:break_ended", ());
             let new_state = make_running_fresh(settings);
-            let s = build_status(&new_state, settings);
-            *status.write().unwrap() = s.clone();
-            let _ = app.emit("timer:state_changed", s);
+            publish_and_emit(app, status, &new_state, settings, "timer:state_changed");
             new_state
         }
-        State::Paused { .. } => {
-            // Tick during paused — just stay paused (loop will sleep 1s again).
+        State::Paused {
+            auto_resume_at: Some(_),
+            ..
+        } => {
+            // Auto-resume timer expired.
+            let new_state = make_running_fresh(settings);
+            publish_and_emit(app, status, &new_state, settings, "timer:state_changed");
+            new_state
+        }
+        State::Paused {
+            auto_resume_at: None,
+            ..
+        } => {
+            // 1-second tick while paused — stay paused.
             state
         }
     }
@@ -283,11 +298,22 @@ fn start_break(
         ends_at,
         postponed_count,
     };
-    let s = build_status(&new_state, settings);
-    *status.write().unwrap() = s.clone();
-    let _ = app.emit("timer:break_started", s);
-    let _ = app.emit("timer:state_changed", build_status(&new_state, settings));
+    publish_and_emit(app, status, &new_state, settings, "timer:break_started");
+    windows::show_overlay(app);
     new_state
+}
+
+fn publish_and_emit(
+    app: &AppHandle,
+    status: &SharedStatus,
+    state: &State,
+    settings: &Settings,
+    event: &str,
+) {
+    let s = build_status(state, settings);
+    *status.write().unwrap() = s.clone();
+    let _ = app.emit(event, &s);
+    let _ = app.emit("timer:state_changed", &s);
 }
 
 fn on_command(
@@ -300,10 +326,20 @@ fn on_command(
     match cmd {
         TimerCommand::Start => {
             let new_state = make_running_fresh(settings);
-            let _ = app.emit("timer:state_changed", build_status(&new_state, settings));
+            publish_and_emit(app, status, &new_state, settings, "timer:state_changed");
             new_state
         }
-        TimerCommand::Pause(reason) => {
+
+        TimerCommand::PauseFor(duration) => {
+            // Close any open windows when pausing.
+            if matches!(state, State::Warning { .. }) {
+                windows::close_warning(app);
+            }
+            if matches!(state, State::OnBreak { .. }) {
+                windows::close_overlay(app);
+                let _ = app.emit("timer:break_ended", ());
+            }
+
             let elapsed_secs = match &state {
                 State::Running { next_break_at, .. } => {
                     let total = settings.timer.interval_minutes as u64 * 60;
@@ -314,64 +350,76 @@ fn on_command(
                 _ => 0,
             };
             let postponed_count = match &state {
-                State::Warning { postponed_count, .. } => *postponed_count,
-                State::OnBreak { postponed_count, .. } => *postponed_count,
+                State::Warning { postponed_count, .. }
+                | State::OnBreak { postponed_count, .. } => *postponed_count,
                 _ => 0,
             };
+            let auto_resume_at = duration.map(|d| Instant::now() + d);
             let new_state = State::Paused {
-                reason,
+                reason: PauseReason::Manual,
                 elapsed_secs,
                 postponed_count,
+                auto_resume_at,
             };
-            let _ = app.emit("timer:state_changed", build_status(&new_state, settings));
+            publish_and_emit(app, status, &new_state, settings, "timer:state_changed");
             new_state
         }
+
         TimerCommand::Resume => {
-            // Reset to full interval on resume per spec (idle detection resets timer).
             let new_state = make_running_fresh(settings);
-            let _ = app.emit("timer:state_changed", build_status(&new_state, settings));
+            publish_and_emit(app, status, &new_state, settings, "timer:state_changed");
             new_state
         }
-        TimerCommand::TakeBreakNow => start_break(app, status, settings, 0),
+
+        TimerCommand::TakeBreakNow => {
+            if matches!(state, State::Warning { .. }) {
+                windows::close_warning(app);
+            }
+            start_break(app, status, settings, 0)
+        }
+
         TimerCommand::SkipNextBreak => {
-            // Skip the next break: restart with a fresh full interval.
+            if matches!(state, State::Warning { .. }) {
+                windows::close_warning(app);
+            }
             let new_state = make_running_fresh(settings);
-            let _ = app.emit("timer:state_changed", build_status(&new_state, settings));
+            publish_and_emit(app, status, &new_state, settings, "timer:state_changed");
             new_state
         }
+
         TimerCommand::PostponeBreak => {
-            let postponed_count = match &state {
-                State::Warning { postponed_count, .. } => postponed_count + 1,
-                State::OnBreak { postponed_count, .. } => postponed_count + 1,
-                _ => 1,
-            };
-            let postpone_by = Duration::from_secs(5 * 60);
+            let extra = Duration::from_secs(5 * 60);
             let new_state = match state {
-                State::Warning { break_at, .. } => State::Warning {
-                    break_at: break_at + postpone_by,
+                State::Warning {
+                    break_at,
                     postponed_count,
+                } => State::Warning {
+                    break_at: break_at + extra,
+                    postponed_count: postponed_count + 1,
                 },
-                State::OnBreak { started_at, ends_at, .. } => State::OnBreak {
+                State::OnBreak {
                     started_at,
-                    ends_at: ends_at + postpone_by,
+                    ends_at,
                     postponed_count,
+                } => State::OnBreak {
+                    started_at,
+                    ends_at: ends_at + extra,
+                    postponed_count: postponed_count + 1,
                 },
                 other => {
-                    // If not in warning/break, just reset the interval.
                     let _ = other;
                     make_running_fresh(settings)
                 }
             };
-            let _ = app.emit("timer:state_changed", build_status(&new_state, settings));
+            publish_and_emit(app, status, &new_state, settings, "timer:state_changed");
             new_state
         }
+
         TimerCommand::SettingsUpdated(new_settings) => {
             *settings = *new_settings;
-            // If running, recompute deadline based on remaining time.
             match state {
                 State::Running { next_break_at, .. } => {
-                    let remaining =
-                        Duration::from_secs(secs_from_now(next_break_at).max(0) as u64);
+                    let remaining = Duration::from_secs(secs_from_now(next_break_at).max(0) as u64);
                     let warning =
                         Duration::from_secs(settings.reminders.warning_seconds as u64);
                     let next_warning_at = if warning >= remaining {

@@ -1,11 +1,14 @@
 mod settings;
 mod state;
 mod timer;
+mod tray;
+mod windows;
 
 use std::sync::{Arc, RwLock};
+use std::time::Duration;
 
 use serde_json::Value;
-use tauri::{Manager, State};
+use tauri::{Manager, State, WindowEvent};
 use tauri_plugin_autostart::MacosLauncher;
 
 use crate::settings::Settings;
@@ -24,7 +27,6 @@ fn update_settings(state: State<'_, AppState>, patch: Value) -> Result<Settings,
     let mut guard = state.settings.write().unwrap();
     let merged = settings::merge_patch(&guard, patch)?;
     settings::save(&state.settings_path, &merged).map_err(|e| format!("save failed: {e}"))?;
-    // Notify timer of new settings.
     let _ = state
         .timer_tx
         .try_send(TimerCommand::SettingsUpdated(Box::new(merged.clone())));
@@ -59,7 +61,16 @@ fn timer_start(state: State<'_, AppState>) {
 fn timer_pause(state: State<'_, AppState>) {
     let _ = state
         .timer_tx
-        .try_send(TimerCommand::Pause(PauseReason::Manual));
+        .try_send(TimerCommand::PauseFor(None));
+}
+
+#[tauri::command]
+fn timer_pause_for(state: State<'_, AppState>, minutes: u32) {
+    let _ = state
+        .timer_tx
+        .try_send(TimerCommand::PauseFor(Some(Duration::from_secs(
+            minutes as u64 * 60,
+        ))));
 }
 
 #[tauri::command]
@@ -106,9 +117,33 @@ pub fn run() {
             let loaded = settings::load(&settings_path);
 
             let timer_status = Arc::new(RwLock::new(TimerStatus::default()));
-            let timer_tx = timer::spawn(app.handle().clone(), loaded.clone(), timer_status.clone());
+            let timer_tx =
+                timer::spawn(app.handle().clone(), loaded.clone(), timer_status.clone());
 
-            app.manage(AppState::new(loaded, settings_path, timer_tx, timer_status));
+            app.manage(AppState::new(
+                loaded,
+                settings_path,
+                timer_tx,
+                timer_status.clone(),
+            ));
+
+            // System tray.
+            tray::setup(app.handle(), timer_status)?;
+
+            // Hide main window on close instead of quitting.
+            let main_win = app.get_webview_window("main").expect("no main window");
+            let win_clone = main_win.clone();
+            main_win.on_window_event(move |event| {
+                if let WindowEvent::CloseRequested { api, .. } = event {
+                    api.prevent_close();
+                    win_clone.hide().ok();
+                }
+            });
+
+            // Main window starts hidden — user opens via tray Preferences.
+            // (Comment this out during dev if you want it visible on launch.)
+            app.get_webview_window("main").map(|w| w.hide().ok());
+
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
@@ -120,6 +155,7 @@ pub fn run() {
             get_timer_status,
             timer_start,
             timer_pause,
+            timer_pause_for,
             timer_resume,
             take_break_now,
             skip_next_break,
