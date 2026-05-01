@@ -7,7 +7,7 @@ use tokio::sync::mpsc;
 use tokio::time::{sleep_until, Instant};
 
 use crate::settings::Settings;
-use crate::windows;
+use crate::{shortcuts, windows};
 
 // ── Public types ─────────────────────────────────────────────────────────────
 
@@ -62,6 +62,8 @@ pub enum TimerCommand {
     TakeBreakNow,
     SkipNextBreak,
     PostponeBreak,
+    /// ESC pressed globally — skips warning or ends break early.
+    EscPressed,
     SettingsUpdated(Box<Settings>),
 }
 
@@ -198,13 +200,14 @@ pub fn spawn(
     status: SharedStatus,
 ) -> mpsc::Sender<TimerCommand> {
     let (tx, mut rx) = mpsc::channel::<TimerCommand>(32);
+    // ESC shortcut handler sends on this cloned sender.
+    let esc_tx = tx.clone();
 
     tokio::spawn(async move {
         let mut settings = initial_settings;
         let mut state = make_running_fresh(&settings);
 
         loop {
-            // Publish current status before sleeping.
             {
                 let s = build_status(&state, &settings);
                 *status.write().unwrap() = s.clone();
@@ -213,10 +216,10 @@ pub fn spawn(
 
             tokio::select! {
                 _ = sleep_until(earliest_deadline(&state)) => {
-                    state = on_deadline(state, &settings, &app, &status);
+                    state = on_deadline(state, &settings, &app, &status, &esc_tx);
                 }
                 Some(cmd) = rx.recv() => {
-                    state = on_command(state, cmd, &mut settings, &app, &status);
+                    state = on_command(state, cmd, &mut settings, &app, &status, &esc_tx);
                 }
             }
         }
@@ -230,6 +233,7 @@ fn on_deadline(
     settings: &Settings,
     app: &AppHandle,
     status: &SharedStatus,
+    esc_tx: &mpsc::Sender<TimerCommand>,
 ) -> State {
     match state {
         State::Running {
@@ -238,15 +242,15 @@ fn on_deadline(
         } => {
             let now = Instant::now();
             if now >= next_break_at {
-                // warning_seconds == 0 — skip straight to break.
-                start_break(app, status, settings, 0)
+                start_break(app, status, settings, 0, esc_tx)
             } else if now >= next_warning_at {
                 let new_state = State::Warning {
                     break_at: next_break_at,
                     postponed_count: 0,
                 };
-                publish_and_emit(app, status, &new_state, settings, "timer:warning_started");
+                publish(app, status, &new_state, settings, "timer:warning_started");
                 windows::show_warning(app).ok();
+                shortcuts::register_esc(app, esc_tx.clone());
                 new_state
             } else {
                 State::Running {
@@ -257,31 +261,21 @@ fn on_deadline(
         }
         State::Warning { postponed_count, .. } => {
             windows::close_warning(app);
-            start_break(app, status, settings, postponed_count)
+            start_break(app, status, settings, postponed_count, esc_tx)
         }
-        State::OnBreak { .. } => {
-            windows::close_overlay(app);
-            let _ = app.emit("timer:break_ended", ());
-            let new_state = make_running_fresh(settings);
-            publish_and_emit(app, status, &new_state, settings, "timer:state_changed");
-            new_state
-        }
+        State::OnBreak { .. } => end_break(app, status, settings),
         State::Paused {
             auto_resume_at: Some(_),
             ..
         } => {
-            // Auto-resume timer expired.
             let new_state = make_running_fresh(settings);
-            publish_and_emit(app, status, &new_state, settings, "timer:state_changed");
+            publish(app, status, &new_state, settings, "timer:state_changed");
             new_state
         }
         State::Paused {
             auto_resume_at: None,
             ..
-        } => {
-            // 1-second tick while paused — stay paused.
-            state
-        }
+        } => state,
     }
 }
 
@@ -290,6 +284,7 @@ fn start_break(
     status: &SharedStatus,
     settings: &Settings,
     postponed_count: u32,
+    esc_tx: &mpsc::Sender<TimerCommand>,
 ) -> State {
     let started_at = Instant::now();
     let ends_at = started_at + Duration::from_secs(settings.timer.break_seconds as u64);
@@ -298,12 +293,28 @@ fn start_break(
         ends_at,
         postponed_count,
     };
-    publish_and_emit(app, status, &new_state, settings, "timer:break_started");
-    windows::show_overlay(app);
+    publish(app, status, &new_state, settings, "timer:break_started");
+    windows::show_overlay(app, settings).ok();
+    // Ensure ESC is registered (might already be from Warning).
+    shortcuts::register_esc(app, esc_tx.clone());
     new_state
 }
 
-fn publish_and_emit(
+fn end_break(app: &AppHandle, status: &SharedStatus, settings: &Settings) -> State {
+    shortcuts::unregister_esc(app);
+    let _ = app.emit("timer:break_ended", ());
+    // Give the overlay 300ms to animate out, then force-close any remaining windows.
+    let app_clone = app.clone();
+    tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        windows::close_overlay(&app_clone);
+    });
+    let new_state = make_running_fresh(settings);
+    publish(app, status, &new_state, settings, "timer:state_changed");
+    new_state
+}
+
+fn publish(
     app: &AppHandle,
     status: &SharedStatus,
     state: &State,
@@ -313,7 +324,9 @@ fn publish_and_emit(
     let s = build_status(state, settings);
     *status.write().unwrap() = s.clone();
     let _ = app.emit(event, &s);
-    let _ = app.emit("timer:state_changed", &s);
+    if event != "timer:state_changed" {
+        let _ = app.emit("timer:state_changed", &s);
+    }
 }
 
 fn on_command(
@@ -322,24 +335,41 @@ fn on_command(
     settings: &mut Settings,
     app: &AppHandle,
     status: &SharedStatus,
+    esc_tx: &mpsc::Sender<TimerCommand>,
 ) -> State {
     match cmd {
         TimerCommand::Start => {
             let new_state = make_running_fresh(settings);
-            publish_and_emit(app, status, &new_state, settings, "timer:state_changed");
+            publish(app, status, &new_state, settings, "timer:state_changed");
             new_state
         }
 
+        TimerCommand::EscPressed => match state {
+            State::Warning { .. } => {
+                windows::close_warning(app);
+                shortcuts::unregister_esc(app);
+                let new_state = make_running_fresh(settings);
+                publish(app, status, &new_state, settings, "timer:state_changed");
+                new_state
+            }
+            State::OnBreak { .. } => end_break(app, status, settings),
+            other => other,
+        },
+
         TimerCommand::PauseFor(duration) => {
-            // Close any open windows when pausing.
             if matches!(state, State::Warning { .. }) {
                 windows::close_warning(app);
+                shortcuts::unregister_esc(app);
             }
             if matches!(state, State::OnBreak { .. }) {
-                windows::close_overlay(app);
+                shortcuts::unregister_esc(app);
                 let _ = app.emit("timer:break_ended", ());
+                let app_clone = app.clone();
+                tokio::spawn(async move {
+                    tokio::time::sleep(Duration::from_millis(300)).await;
+                    windows::close_overlay(&app_clone);
+                });
             }
-
             let elapsed_secs = match &state {
                 State::Running { next_break_at, .. } => {
                     let total = settings.timer.interval_minutes as u64 * 60;
@@ -354,20 +384,19 @@ fn on_command(
                 | State::OnBreak { postponed_count, .. } => *postponed_count,
                 _ => 0,
             };
-            let auto_resume_at = duration.map(|d| Instant::now() + d);
             let new_state = State::Paused {
                 reason: PauseReason::Manual,
                 elapsed_secs,
                 postponed_count,
-                auto_resume_at,
+                auto_resume_at: duration.map(|d| Instant::now() + d),
             };
-            publish_and_emit(app, status, &new_state, settings, "timer:state_changed");
+            publish(app, status, &new_state, settings, "timer:state_changed");
             new_state
         }
 
         TimerCommand::Resume => {
             let new_state = make_running_fresh(settings);
-            publish_and_emit(app, status, &new_state, settings, "timer:state_changed");
+            publish(app, status, &new_state, settings, "timer:state_changed");
             new_state
         }
 
@@ -375,15 +404,16 @@ fn on_command(
             if matches!(state, State::Warning { .. }) {
                 windows::close_warning(app);
             }
-            start_break(app, status, settings, 0)
+            start_break(app, status, settings, 0, esc_tx)
         }
 
         TimerCommand::SkipNextBreak => {
             if matches!(state, State::Warning { .. }) {
                 windows::close_warning(app);
+                shortcuts::unregister_esc(app);
             }
             let new_state = make_running_fresh(settings);
-            publish_and_emit(app, status, &new_state, settings, "timer:state_changed");
+            publish(app, status, &new_state, settings, "timer:state_changed");
             new_state
         }
 
@@ -411,7 +441,7 @@ fn on_command(
                     make_running_fresh(settings)
                 }
             };
-            publish_and_emit(app, status, &new_state, settings, "timer:state_changed");
+            publish(app, status, &new_state, settings, "timer:state_changed");
             new_state
         }
 
@@ -419,7 +449,8 @@ fn on_command(
             *settings = *new_settings;
             match state {
                 State::Running { next_break_at, .. } => {
-                    let remaining = Duration::from_secs(secs_from_now(next_break_at).max(0) as u64);
+                    let remaining =
+                        Duration::from_secs(secs_from_now(next_break_at).max(0) as u64);
                     let warning =
                         Duration::from_secs(settings.reminders.warning_seconds as u64);
                     let next_warning_at = if warning >= remaining {

@@ -8,7 +8,7 @@ use tauri::{
 
 use crate::{
     state::AppState,
-    timer::{PauseReason, SharedStatus, TimerCommand, StateKind},
+    timer::{SharedStatus, TimerCommand, StateKind},
 };
 
 pub fn setup(app: &AppHandle, timer_status: SharedStatus) -> tauri::Result<()> {

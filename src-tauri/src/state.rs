@@ -1,5 +1,5 @@
 use std::path::PathBuf;
-use std::sync::{Arc, RwLock};
+use std::sync::RwLock;
 
 use tokio::sync::mpsc;
 
@@ -33,4 +33,3 @@ impl AppState {
     }
 }
 
-pub type SharedTimerStatus = Arc<RwLock<TimerStatus>>;

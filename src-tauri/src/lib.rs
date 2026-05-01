@@ -1,4 +1,5 @@
 mod settings;
+mod shortcuts;
 mod state;
 mod timer;
 mod tray;
@@ -13,7 +14,7 @@ use tauri_plugin_autostart::MacosLauncher;
 
 use crate::settings::Settings;
 use crate::state::AppState;
-use crate::timer::{PauseReason, TimerCommand, TimerStatus};
+use crate::timer::{TimerCommand, TimerStatus};
 
 // ── Settings commands ─────────────────────────────────────────────────────────
 
