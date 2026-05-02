@@ -132,7 +132,7 @@ fn configure_overlay_window(win: &tauri::WebviewWindow, focus: bool) {
     {
         let win = win.clone();
         win.clone().run_on_main_thread(move || {
-            use objc2::runtime::{AnyClass, AnyObject};
+            use objc2::runtime::{AnyClass, AnyObject, Bool};
             use objc2::{class, msg_send};
             use raw_window_handle::{HasWindowHandle, RawWindowHandle};
 
@@ -159,6 +159,13 @@ fn configure_overlay_window(win: &tauri::WebviewWindow, focus: bool) {
                 // regular NSWindows are silently rejected from full-screen Spaces.
                 let panel_class: &AnyClass = class!(NSPanel);
                 object_setClass(ns_window, panel_class as *const _);
+
+                // NSPanel defaults `releasedWhenClosed = YES`, which deallocates
+                // the Obj-C object on first close(). The frontend (BreakOverlay)
+                // and backend (close_overlay) both call close() during break-end,
+                // so the second one hits a freed pointer → SIGABRT. Disable it;
+                // Tauri/wry owns the lifetime.
+                let _: () = msg_send![ns_window, setReleasedWhenClosed: Bool::NO];
 
                 // Add NSWindowStyleMaskNonactivatingPanel (1 << 7) — required for the
                 // panel to act as a non-focus-stealing overlay.
