@@ -34,13 +34,14 @@ Tauri 2.x: a Rust process hosts native OS windows containing a WebView. The fron
 | `lib.rs` | Plugin/command registration, app setup, panic-log hook |
 | `state.rs` | `AppState` — settings, settings path, timer channel, shared status snapshot, optional DB handle |
 | `timer.rs` | Single tokio task owning the state machine (`Running` / `Warning` / `OnBreak` / `Paused`); driven by a `tokio::select!` over a deadline and a command channel |
-| `windows.rs` | Builds the warning toast and per-monitor overlay windows; macOS NSPanel configuration |
+| `windows.rs` | Builds the warning toast and per-monitor overlay windows; macOS overlay configuration (collectionBehavior + level) |
 | `tray.rs` | Tray menu, live countdown updater, icon-state switching |
 | `shortcuts.rs` | Registers/unregisters ESC global shortcut for the duration of a warning/break |
 | `idle.rs` | Polls `user-idle`; emits `IdlePause`/`IdleResume`. Also detects machine sleep via wall-clock skew |
 | `schedule.rs` | Pure function: `is_within_active_hours(settings)` — handles overnight windows |
 | `settings.rs` | Schema, JSON load/save, deep-merge patch |
 | `db.rs` | rusqlite-backed `break_events` table; queries for day stats and aggregates |
+| `spaces.rs` (macOS only) | Switches out of fullscreen Spaces at break start via private CGS Skylight APIs |
 
 ### Frontend (`src/`)
 
@@ -88,10 +89,10 @@ Currently registered: `opener`, `autostart`, `notification`, `global-shortcut`, 
 ## Implementation notes (easy-to-miss details)
 
 - **Timer is event-driven, not tick-driven.** The task sleeps until the next deadline (`earliest_deadline`) or the next command. UI countdowns must interpolate from the last published `TimerStatus` against wall-clock time — see `tray.rs` for the canonical pattern. Do not assume `timer:tick` fires every second.
-- **macOS overlay = NSPanel, not NSWindow.** `configure_overlay_window` in `windows.rs` swaps the live class via `object_setClass`, then sets `NSWindowStyleMaskNonactivatingPanel`, `canJoinAllSpaces | fullScreenAuxiliary`, and `NSScreenSaverWindowLevel (1000)`. Without this, the overlay disappears in full-screen Spaces.
-- **NSPanel `releasedWhenClosed` must be set to NO.** Both the frontend (`BreakOverlay`) and backend (`close_overlay`) call `close()` on break-end; without disabling the auto-release, the second call hits a freed pointer and SIGABRTs.
+- **macOS overlay is a plain NSWindow.** `configure_overlay_window` in `windows.rs` sets `collectionBehavior = canJoinAllSpaces | stationary | fullScreenAuxiliary` and `level = NSScreenSaverWindowLevel (1000)` on the regular NSWindow. Do *not* try to class-swap to NSPanel via `object_setClass` — the live object's memory layout is NSWindow, so any NSPanel method that reads NSPanel-only ivars triggers an Obj-C exception during AppKit's window-cleanup path. Rust can't unwind through that → `fatal runtime error: Rust cannot catch foreign exceptions, aborting`. The crash does not appear in `panic.log` because no Rust panic was raised.
+- **Fullscreen Spaces are handled by switching out of them, not by overlaying onto them.** A regular NSWindow with `fullScreenAuxiliary` does not render on a fullscreen-app Space. `spaces.rs` uses private CGS Skylight APIs (`_CGSDefaultConnection`, `CGSCopyManagedDisplaySpaces`, `CGSManagedDisplaySetCurrentSpace`) to detect fullscreen Spaces and switch each affected display to its first user/desktop Space at break start. Scheduled on the main thread before window creation so the Space switch is enqueued ahead of wry's window-create tasks.
 - **Build overlay hidden, configure, then show.** Setting `NSWindowCollectionBehavior` after the window is already on a Space anchors it to that Space only.
-- **`macOSPrivateApi: true`** in `tauri.conf.json` is required for the NSPanel work and for `transparent: true` overlays.
+- **`macOSPrivateApi: true`** in `tauri.conf.json` is required for `transparent: true` overlays.
 - **ESC is a global shortcut**, not a window key handler. `shortcuts::register_esc` runs only while a warning or break is active and is unregistered on exit — do not rely on focus inside the overlay window.
 - **Idle pause resets the timer** on resume (`make_running_fresh`), it does not resume the elapsed count. Also: if `actual_elapsed` between idle polls vastly exceeds `POLL`, the machine likely slept — `idle.rs` treats that as an immediate `IdlePause`.
 - **Active hours are re-evaluated every tick** (`check_schedule` in the timer loop) and the `Running`/`Paused(OutsideHours)` transition is automatic. When active hours are enabled, the timer also wakes at least every 60 s to detect window boundaries.
@@ -99,7 +100,7 @@ Currently registered: `opener`, `autostart`, `notification`, `global-shortcut`, 
 - **Main window hides on close, never quits.** `WindowEvent::CloseRequested` calls `prevent_close()` + `hide()`. The only quit path is the tray "Quit" item.
 - **First-run flow:** if `settings.general.onboarded` is false, the main window is shown on launch and `MainWindowGate` renders `<Onboarding>`. Otherwise the app starts hidden in the tray.
 - **Analytics schema:** `break_events(id, timestamp TEXT (RFC3339 UTC), status, duration_actual, monitor_count)`. `status` ∈ {`completed`, `skipped`, `postponed`}. Day grouping happens in `query_day_stats` against local time so DST is handled correctly.
-- **Panic log:** `set_hook` writes to `<app_data_dir>/logs/panic.log`. Useful when debugging silent crashes (especially the macOS NSPanel path).
+- **Panic log:** `set_hook` writes to `<app_data_dir>/logs/panic.log`. Catches Rust panics only — Obj-C/foreign exceptions abort without going through this hook (check `~/Library/Logs/DiagnosticReports/opti-break-*.ips` for those).
 
 ## Window and app config
 

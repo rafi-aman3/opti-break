@@ -3,6 +3,8 @@ mod idle;
 mod schedule;
 mod settings;
 mod shortcuts;
+#[cfg(target_os = "macos")]
+mod spaces;
 mod state;
 mod timer;
 mod tray;

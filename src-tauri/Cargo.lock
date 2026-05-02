@@ -2868,6 +2868,7 @@ dependencies = [
  "chrono",
  "image",
  "objc2",
+ "objc2-foundation",
  "raw-window-handle",
  "rusqlite",
  "serde",

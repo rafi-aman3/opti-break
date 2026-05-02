@@ -52,6 +52,15 @@ pub fn close_warning(app: &AppHandle) {
 const OVERLAY_PREFIX: &str = "overlay_";
 
 pub fn show_overlay(app: &AppHandle, settings: &Settings) -> tauri::Result<()> {
+    // If any display is on a fullscreen Space, switch to its desktop Space
+    // first — our plain-NSWindow overlay does not render on fullscreen Spaces.
+    // Scheduled on the main thread before window creation so the Space switch
+    // is enqueued ahead of the window-create tasks wry posts internally.
+    #[cfg(target_os = "macos")]
+    {
+        let _ = app.run_on_main_thread(|| crate::spaces::leave_fullscreen_spaces());
+    }
+
     let opacity = settings.break_.dim_opacity;
 
     let monitors: Vec<_> = match settings.break_.monitors {
@@ -132,17 +141,9 @@ fn configure_overlay_window(win: &tauri::WebviewWindow, focus: bool) {
     {
         let win = win.clone();
         win.clone().run_on_main_thread(move || {
-            use objc2::runtime::{AnyClass, AnyObject, Bool};
-            use objc2::{class, msg_send};
+            use objc2::runtime::AnyObject;
+            use objc2::msg_send;
             use raw_window_handle::{HasWindowHandle, RawWindowHandle};
-
-            // object_setClass: low-level Obj-C runtime call to swap a live object's class.
-            extern "C" {
-                fn object_setClass(
-                    obj: *mut AnyObject,
-                    cls: *const AnyClass,
-                ) -> *const AnyClass;
-            }
 
             let Ok(handle) = win.window_handle() else { return };
             let RawWindowHandle::AppKit(h) = handle.as_raw() else { return };
@@ -154,26 +155,9 @@ fn configure_overlay_window(win: &tauri::WebviewWindow, focus: bool) {
                     return;
                 }
 
-                // Convert NSWindow → NSPanel. Apple only honours
-                // NSWindowCollectionBehaviorFullScreenAuxiliary on NSPanels;
-                // regular NSWindows are silently rejected from full-screen Spaces.
-                let panel_class: &AnyClass = class!(NSPanel);
-                object_setClass(ns_window, panel_class as *const _);
-
-                // NSPanel defaults `releasedWhenClosed = YES`, which deallocates
-                // the Obj-C object on first close(). The frontend (BreakOverlay)
-                // and backend (close_overlay) both call close() during break-end,
-                // so the second one hits a freed pointer → SIGABRT. Disable it;
-                // Tauri/wry owns the lifetime.
-                let _: () = msg_send![ns_window, setReleasedWhenClosed: Bool::NO];
-
-                // Add NSWindowStyleMaskNonactivatingPanel (1 << 7) — required for the
-                // panel to act as a non-focus-stealing overlay.
-                let cur_mask: usize = msg_send![ns_window, styleMask];
-                let _: () = msg_send![ns_window, setStyleMask: cur_mask | (1usize << 7)];
-
-                // canJoinAllSpaces (1) | fullScreenAuxiliary (1 << 8)
-                let _: () = msg_send![ns_window, setCollectionBehavior: (1usize | (1usize << 8))];
+                // canJoinAllSpaces (1) | stationary (1 << 4) | fullScreenAuxiliary (1 << 8)
+                let _: () = msg_send![ns_window, setCollectionBehavior:
+                    (1usize | (1usize << 4) | (1usize << 8))];
 
                 // NSScreenSaverWindowLevel = 1000 — paints above full-screen app content.
                 let _: () = msg_send![ns_window, setLevel: 1000i64];
