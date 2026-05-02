@@ -81,13 +81,20 @@ function MainWindow({ initialTab }: { initialTab: MainTab }) {
         .catch(console.error);
     mq.addEventListener("change", mqListener);
 
-    const unsub = listen<Settings>("settings:updated", (e) =>
+    const unsubSettings = listen<Settings>("settings:updated", (e) =>
       applyTheme(e.payload.general.theme)
     );
 
+    const unsubNav = listen<string>("navigate", (e) => {
+      if (e.payload === "stats" || e.payload === "preferences") {
+        setTab(e.payload);
+      }
+    });
+
     return () => {
       mq.removeEventListener("change", mqListener);
-      unsub.then((fn) => fn());
+      unsubSettings.then((fn) => fn());
+      unsubNav.then((fn) => fn());
     };
   }, []);
 

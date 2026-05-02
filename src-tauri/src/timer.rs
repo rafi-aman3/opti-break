@@ -254,7 +254,7 @@ pub fn spawn(
     let (tx, mut rx) = mpsc::channel::<TimerCommand>(32);
     let esc_tx = tx.clone();
 
-    tokio::spawn(async move {
+    tauri::async_runtime::spawn(async move {
         let mut settings = initial_settings;
         let mut state = make_running_fresh(&settings);
 
@@ -373,7 +373,7 @@ fn end_break(
 
     let _ = app.emit("timer:break_ended", ());
     let app_clone = app.clone();
-    tokio::spawn(async move {
+    tauri::async_runtime::spawn(async move {
         tokio::time::sleep(Duration::from_millis(300)).await;
         windows::close_overlay(&app_clone);
     });
@@ -449,7 +449,7 @@ fn on_command(
                 }
                 let _ = app.emit("timer:break_ended", ());
                 let app_clone = app.clone();
-                tokio::spawn(async move {
+                tauri::async_runtime::spawn(async move {
                     tokio::time::sleep(Duration::from_millis(300)).await;
                     windows::close_overlay(&app_clone);
                 });

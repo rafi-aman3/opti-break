@@ -219,11 +219,11 @@ pub fn run() {
             });
 
             // Show onboarding on first launch; otherwise start hidden.
+            // Frontend (MainWindowGate) checks onboarded from settings and renders accordingly.
             if onboarded {
                 app.get_webview_window("main").map(|w| w.hide().ok());
             } else {
                 if let Some(win) = app.get_webview_window("main") {
-                    win.navigate("index.html?route=onboarding".parse().unwrap()).ok();
                     win.show().ok();
                     win.center().ok();
                 }

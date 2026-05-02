@@ -12,7 +12,7 @@ const POLL: Duration = Duration::from_secs(5);
 const SLEEP_EXTRA: Duration = Duration::from_secs(30);
 
 pub fn spawn(timer_tx: mpsc::Sender<TimerCommand>, settings: Arc<RwLock<Settings>>) {
-    tokio::spawn(async move {
+    tauri::async_runtime::spawn(async move {
         let mut was_idle = false;
         let mut last_poll = Instant::now();
 

@@ -1,9 +1,9 @@
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use tauri::{
     menu::{MenuBuilder, MenuItemBuilder, PredefinedMenuItem, SubmenuBuilder},
     tray::TrayIconBuilder,
-    AppHandle, Manager,
+    AppHandle, Emitter, Manager,
 };
 
 use crate::{
@@ -61,6 +61,7 @@ pub fn setup(app: &AppHandle, timer_status: SharedStatus) -> tauri::Result<()> {
 
     TrayIconBuilder::with_id("main")
         .icon(icon)
+        .icon_as_template(true)
         .tooltip("opti-break")
         .menu(&menu)
         .show_menu_on_left_click(true)
@@ -68,25 +69,56 @@ pub fn setup(app: &AppHandle, timer_status: SharedStatus) -> tauri::Result<()> {
         .build(app)?;
 
     // ── Background tooltip + icon updater ─────────────────────────────────────
+    // The timer only writes TimerStatus when it wakes (e.g. at the warning
+    // deadline, ~19 min away). To show a live countdown we anchor the last
+    // published seconds value and subtract wall-clock elapsed time ourselves.
     let app_handle = app.clone();
     let status_item_clone = status_item.clone();
     let mut last_icon_state: Option<TrayIconState> = None;
-    tokio::spawn(async move {
+
+    // Anchor: the timer-published values and the instant we first saw them.
+    let mut anchor_state: Option<StateKind> = None;
+    let mut anchor_until_break: Option<i64> = None;
+    let mut anchor_remaining: Option<i64> = None;
+    let mut anchored_at = Instant::now();
+
+    tauri::async_runtime::spawn(async move {
         loop {
-            tokio::time::sleep(Duration::from_secs(10)).await;
             let snapshot = timer_status.read().unwrap().clone();
-            let text = format_status_text(&snapshot);
+
+            // Re-anchor whenever the timer publishes genuinely new values.
+            if Some(snapshot.state) != anchor_state
+                || snapshot.seconds_until_break != anchor_until_break
+                || snapshot.seconds_remaining_in_break != anchor_remaining
+            {
+                anchored_at = Instant::now();
+                anchor_state = Some(snapshot.state);
+                anchor_until_break = snapshot.seconds_until_break;
+                anchor_remaining = snapshot.seconds_remaining_in_break;
+            }
+
+            // Derive live seconds by subtracting wall-clock elapsed since anchor.
+            let elapsed = anchored_at.elapsed().as_secs() as i64;
+            let live_until_break = anchor_until_break.map(|a| (a - elapsed).max(0));
+            let live_remaining = anchor_remaining.map(|a| (a - elapsed).max(0));
+
+            let text = format_status_text(snapshot.state, live_until_break);
             let _ = status_item_clone.set_text(&text);
             if let Some(tray) = app_handle.tray_by_id("main") {
                 let _ = tray.set_tooltip(Some(text));
-                let icon_state = tray_icon_state(&snapshot);
+                let _ = tray.set_title(Some(
+                    format_tray_title(snapshot.state, live_until_break, live_remaining).as_str(),
+                ));
+                let icon_state = tray_icon_state(snapshot.state, live_until_break);
                 if Some(icon_state) != last_icon_state {
                     if let Some(icon) = load_tray_icon(icon_state) {
                         let _ = tray.set_icon(Some(icon));
+                        let _ = tray.set_icon_as_template(true);
                     }
                     last_icon_state = Some(icon_state);
                 }
             }
+            tokio::time::sleep(Duration::from_secs(1)).await;
         }
     });
 
@@ -127,8 +159,7 @@ fn handle_menu(app: &AppHandle, id: &str) {
         "stats" | "preferences" => {
             if let Some(win) = app.get_webview_window("main") {
                 let route = if id == "stats" { "stats" } else { "preferences" };
-                let url = format!("index.html?route={route}");
-                win.navigate(url.parse().unwrap()).ok();
+                win.emit("navigate", route).ok();
                 win.show().ok();
                 win.set_focus().ok();
             }
@@ -140,12 +171,12 @@ fn handle_menu(app: &AppHandle, id: &str) {
     }
 }
 
-fn format_status_text(status: &crate::timer::TimerStatus) -> String {
-    match status.state {
+fn format_status_text(state: StateKind, live_until_break: Option<i64>) -> String {
+    match state {
         StateKind::Running => {
-            if let Some(secs) = status.seconds_until_break {
-                let m = secs.max(0) / 60;
-                let s = secs.max(0) % 60;
+            if let Some(secs) = live_until_break {
+                let m = secs / 60;
+                let s = secs % 60;
                 format!("opti-break · next break in {m}:{s:02}")
             } else {
                 "opti-break".to_string()
@@ -154,6 +185,30 @@ fn format_status_text(status: &crate::timer::TimerStatus) -> String {
         StateKind::Warning => "opti-break · break starting soon".to_string(),
         StateKind::OnBreak => "opti-break · eye break".to_string(),
         StateKind::Paused => "opti-break · paused".to_string(),
+    }
+}
+
+fn format_tray_title(
+    state: StateKind,
+    live_until_break: Option<i64>,
+    live_remaining: Option<i64>,
+) -> String {
+    match state {
+        StateKind::Running | StateKind::Warning => {
+            if let Some(secs) = live_until_break {
+                format!("{}:{:02}", secs / 60, secs % 60)
+            } else {
+                String::new()
+            }
+        }
+        StateKind::OnBreak => {
+            if let Some(secs) = live_remaining {
+                format!("{}s", secs)
+            } else {
+                String::new()
+            }
+        }
+        StateKind::Paused => String::new(),
     }
 }
 
@@ -166,13 +221,12 @@ enum TrayIconState {
     Warning,
 }
 
-fn tray_icon_state(status: &crate::timer::TimerStatus) -> TrayIconState {
-    match status.state {
+fn tray_icon_state(state: StateKind, live_until_break: Option<i64>) -> TrayIconState {
+    match state {
         StateKind::Warning | StateKind::OnBreak => TrayIconState::Warning,
         StateKind::Paused => TrayIconState::Paused,
         StateKind::Running => {
-            // Last-minute alert: ≤60 seconds to break
-            if status.seconds_until_break.map(|s| s <= 60).unwrap_or(false) {
+            if live_until_break.map(|s| s <= 60).unwrap_or(false) {
                 TrayIconState::Warning
             } else {
                 TrayIconState::Running
@@ -200,6 +254,5 @@ fn mins_until_midnight() -> u64 {
         now.hour() as u64 * 3600 + now.minute() as u64 * 60 + now.second() as u64;
     let secs_in_day = 24 * 3600u64;
     let remaining_secs = secs_in_day.saturating_sub(secs_since_midnight);
-    // at least 1 min
     (remaining_secs / 60).max(1)
 }
