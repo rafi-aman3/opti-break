@@ -95,17 +95,22 @@ pub fn show_overlay(app: &AppHandle, settings: &Settings) -> tauri::Result<()> {
             settings.timer.break_seconds
         );
 
-        WebviewWindowBuilder::new(app, &label, WebviewUrl::App(url.into()))
+        // Build hidden so we can set NSWindowCollectionBehavior before the window
+        // is assigned to any Space. Showing it first and configuring later causes
+        // macOS to anchor the window to the current Space only.
+        let win = WebviewWindowBuilder::new(app, &label, WebviewUrl::App(url.into()))
             .decorations(false)
             .transparent(true)
             .always_on_top(true)
-            .focused(is_primary)
+            .focused(false)
             .skip_taskbar(true)
             .resizable(false)
             .shadow(false)
+            .visible(false)
             .position(lx, ly)
             .inner_size(lw, lh)
             .build()?;
+        configure_overlay_window(&win, is_primary);
     }
 
     Ok(())
@@ -116,6 +121,70 @@ pub fn close_overlay(app: &AppHandle) {
     for (label, win) in app.webview_windows() {
         if label.starts_with(OVERLAY_PREFIX) {
             win.close().ok();
+        }
+    }
+}
+
+// ── Overlay window configuration ─────────────────────────────────────────────
+
+fn configure_overlay_window(win: &tauri::WebviewWindow, focus: bool) {
+    #[cfg(target_os = "macos")]
+    {
+        let win = win.clone();
+        win.clone().run_on_main_thread(move || {
+            use objc2::runtime::{AnyClass, AnyObject};
+            use objc2::{class, msg_send};
+            use raw_window_handle::{HasWindowHandle, RawWindowHandle};
+
+            // object_setClass: low-level Obj-C runtime call to swap a live object's class.
+            extern "C" {
+                fn object_setClass(
+                    obj: *mut AnyObject,
+                    cls: *const AnyClass,
+                ) -> *const AnyClass;
+            }
+
+            let Ok(handle) = win.window_handle() else { return };
+            let RawWindowHandle::AppKit(h) = handle.as_raw() else { return };
+
+            let ns_view = h.ns_view.as_ptr() as *mut AnyObject;
+            unsafe {
+                let ns_window: *mut AnyObject = msg_send![ns_view, window];
+                if ns_window.is_null() {
+                    return;
+                }
+
+                // Convert NSWindow → NSPanel. Apple only honours
+                // NSWindowCollectionBehaviorFullScreenAuxiliary on NSPanels;
+                // regular NSWindows are silently rejected from full-screen Spaces.
+                let panel_class: &AnyClass = class!(NSPanel);
+                object_setClass(ns_window, panel_class as *const _);
+
+                // Add NSWindowStyleMaskNonactivatingPanel (1 << 7) — required for the
+                // panel to act as a non-focus-stealing overlay.
+                let cur_mask: usize = msg_send![ns_window, styleMask];
+                let _: () = msg_send![ns_window, setStyleMask: cur_mask | (1usize << 7)];
+
+                // canJoinAllSpaces (1) | fullScreenAuxiliary (1 << 8)
+                let _: () = msg_send![ns_window, setCollectionBehavior: (1usize | (1usize << 8))];
+
+                // NSScreenSaverWindowLevel = 1000 — paints above full-screen app content.
+                let _: () = msg_send![ns_window, setLevel: 1000i64];
+            }
+
+            win.show().ok();
+            if focus {
+                win.set_focus().ok();
+            }
+        })
+        .ok();
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        win.set_visible_on_all_workspaces(true).ok();
+        win.show().ok();
+        if focus {
+            win.set_focus().ok();
         }
     }
 }

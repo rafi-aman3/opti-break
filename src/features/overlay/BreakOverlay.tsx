@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState } from "react";
 import { getCurrentWindow } from "@tauri-apps/api/window";
-import { onTick, onBreakEnded, fmtSeconds } from "../../lib/timer-client";
+import { onBreakEnded, fmtSeconds } from "../../lib/timer-client";
 
 function urlParam(key: string): string | null {
   return new URLSearchParams(window.location.search).get(key);
@@ -11,35 +11,31 @@ export function BreakOverlay() {
   const opacity = parseFloat(urlParam("opacity") ?? "0.78");
 
   const [visible, setVisible] = useState(false);
-  const [secsRemaining, setSecsRemaining] = useState<number | null>(null);
+  const [secsRemaining, setSecsRemaining] = useState(totalSeconds);
   const closingRef = useRef(false);
 
   useEffect(() => {
-    // Trigger fade-in after first paint.
     requestAnimationFrame(() => setVisible(true));
 
-    const unTick = onTick((s) => {
-      if (s.seconds_remaining_in_break !== null) {
-        setSecsRemaining(s.seconds_remaining_in_break);
-      }
-    });
+    const id = setInterval(() => {
+      setSecsRemaining((prev) => Math.max(0, prev - 1));
+    }, 1000);
 
     const unEnded = onBreakEnded(() => {
       if (closingRef.current) return;
       closingRef.current = true;
+      clearInterval(id);
       setVisible(false);
       setTimeout(() => getCurrentWindow().close(), 260);
     });
 
     return () => {
-      unTick.then((fn) => fn());
+      clearInterval(id);
       unEnded.then((fn) => fn());
     };
   }, []);
 
-  // Fraction of break elapsed (0 → 1).
-  const progress =
-    secsRemaining !== null ? 1 - Math.max(0, secsRemaining) / totalSeconds : 0;
+  const progress = 1 - Math.max(0, secsRemaining) / totalSeconds;
 
   return (
     <div
