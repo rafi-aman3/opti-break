@@ -3,6 +3,7 @@ mod idle;
 mod schedule;
 mod settings;
 mod shortcuts;
+mod sounds;
 #[cfg(target_os = "macos")]
 mod spaces;
 mod state;
@@ -113,6 +114,13 @@ fn skip_next_break(state: State<'_, AppState>) {
 #[tauri::command]
 fn postpone_break(state: State<'_, AppState>) {
     let _ = state.timer_tx.try_send(TimerCommand::PostponeBreak);
+}
+
+// ── Sound commands ─────────────────────────────────────────────────────────────
+
+#[tauri::command]
+fn play_sound(id: String, volume: f32) {
+    sounds::play(&id, volume);
 }
 
 // ── Analytics commands ─────────────────────────────────────────────────────────
@@ -247,6 +255,8 @@ pub fn run() {
             take_break_now,
             skip_next_break,
             postpone_break,
+            // sound
+            play_sound,
             // analytics
             get_day_stats,
             get_aggregates,

@@ -19,6 +19,9 @@ pnpm build
 
 # Build production distributable
 pnpm tauri build
+
+# Regenerate tray icons (tray-{running,paused,warning}.png + @2x) from inline SVG
+pnpm gen-tray-icons
 ```
 
 No test suite or linter is configured. `pnpm build` runs `tsc -noEmit` as the primary static check.
@@ -31,6 +34,7 @@ Tauri 2.x: a Rust process hosts native OS windows containing a WebView. The fron
 
 | Module | Role |
 |---|---|
+| `main.rs` | Binary entrypoint — calls `opti_break_lib::run()` |
 | `lib.rs` | Plugin/command registration, app setup, panic-log hook |
 | `state.rs` | `AppState` — settings, settings path, timer channel, shared status snapshot, optional DB handle |
 | `timer.rs` | Single tokio task owning the state machine (`Running` / `Warning` / `OnBreak` / `Paused`); driven by a `tokio::select!` over a deadline and a command channel |

@@ -9,7 +9,7 @@ use tokio::time::{sleep_until, Instant};
 use crate::db;
 use crate::schedule;
 use crate::settings::Settings;
-use crate::{shortcuts, windows};
+use crate::{shortcuts, sounds, windows};
 
 // ── Public types ─────────────────────────────────────────────────────────────
 
@@ -306,6 +306,9 @@ fn on_deadline(
                 publish(app, status, &new_state, settings, "timer:warning_started");
                 windows::show_warning(app).ok();
                 shortcuts::register_esc(app, esc_tx.clone());
+                if settings.reminders.sound_enabled {
+                    sounds::play(&settings.reminders.sound_id, settings.reminders.volume as f32);
+                }
                 new_state
             } else {
                 State::Running {

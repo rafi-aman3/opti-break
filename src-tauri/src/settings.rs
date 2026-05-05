@@ -29,6 +29,12 @@ pub struct ReminderSettings {
     pub warning_seconds: u32,
     pub sound_enabled: bool,
     pub sound_id: String,
+    #[serde(default = "default_volume")]
+    pub volume: f64,
+}
+
+fn default_volume() -> f64 {
+    0.7
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -88,7 +94,8 @@ impl Default for Settings {
             reminders: ReminderSettings {
                 warning_seconds: 10,
                 sound_enabled: false,
-                sound_id: "chime_soft".to_string(),
+                sound_id: "Glass".to_string(),
+                volume: 0.7,
             },
             schedule: ScheduleSettings {
                 active_hours_enabled: false,
